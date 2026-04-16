@@ -1,0 +1,29 @@
+# Dependencies
+node_modules/
+
+# Env files
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+
+# Temp
+tmp/
+temp/
+
+# Ignore all unnecessary folders from your zip
+noori-changes/
+sahilos-changes/
+
+# Misc
+*.zip
