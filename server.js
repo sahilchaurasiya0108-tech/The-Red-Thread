@@ -6,6 +6,7 @@ import dotenv from 'dotenv';
 import mongoose from 'mongoose';
 
 import threadRouter from './routes/thread.js';
+import pushRouter from './routes/push.js';
 import { initSocket } from './socket.js';
 
 dotenv.config();
@@ -16,7 +17,6 @@ const server = http.createServer(app);
 const PORT = process.env.PORT || 4000;
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/red-thread';
 
-// Parse allowed origins from env (comma-separated)
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || 'http://localhost:5173,http://localhost:3000')
   .split(',')
   .map((o) => o.trim());
@@ -25,7 +25,6 @@ const allowedOrigins = (process.env.ALLOWED_ORIGINS || 'http://localhost:5173,ht
 app.use(
   cors({
     origin: (origin, callback) => {
-      // Allow requests with no origin (e.g., curl, Postman)
       if (!origin) return callback(null, true);
       if (allowedOrigins.includes(origin)) return callback(null, true);
       callback(new Error(`Origin ${origin} not allowed by CORS`));
@@ -49,6 +48,9 @@ initSocket(io);
 // ── REST routes ───────────────────────────────────────────────────────────────
 app.use('/thread', threadRouter);
 
+// Push subscription management (subscribe / unsubscribe / vapid-key)
+app.use('/push', pushRouter);
+
 app.get('/health', (_req, res) => {
   res.json({
     status: 'alive',
@@ -71,7 +73,6 @@ mongoose
     process.exit(1);
   });
 
-// ── Graceful shutdown ─────────────────────────────────────────────────────────
 process.on('unhandledRejection', (err) => {
   console.error('UNHANDLED REJECTION:', err.message);
   server.close(() => process.exit(1));

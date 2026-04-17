@@ -1,5 +1,6 @@
 import Message from './models/Message.js';
 import Presence from './models/Presence.js';
+import { notifyNewMessage } from './push.js';
 
 const ALLOWED_USERS = ['sahil', 'gauri'];
 
@@ -42,10 +43,8 @@ export function initSocket(io) {
       }
 
       // ── On join: auto-mark messages from the OTHER user as seen ─────────────
-      // This handles the case where both users are online when a message arrives:
-      // the recipient is already in the room so they see it immediately.
       try {
-        const sender = otherId; // messages FROM the other person, seen by this person
+        const sender = otherId;
         const unseenMessages = await Message.find({
           threadId: 'red-thread',
           sender,
@@ -56,7 +55,6 @@ export function initSocket(io) {
           const messageIds = unseenMessages.map((m) => m._id);
           await Message.updateMany({ _id: { $in: messageIds } }, { $set: { seen: true } });
 
-          // Tell the sender their messages are now seen
           socket.to('red-thread').emit('messagesSeenUpdate', {
             messageIds: messageIds.map(String),
             seenBy: userId,
@@ -98,30 +96,41 @@ export function initSocket(io) {
           };
         }
 
-        // Check if the OTHER user is currently online in the room
-        // If they are, mark the message as already seen immediately
         const recipientId = sender === 'sahil' ? 'gauri' : 'sahil';
         const recipientIsOnline = [...connectedUsers.values()].includes(recipientId);
 
+        // Always save as seen: false — we mark it seen via a separate event
+        // so the sender sees a single tick first, then double tick after seen update
         const message = await Message.create({
           threadId: 'red-thread',
           sender,
           text: text.trim(),
-          seen: recipientIsOnline, // ← already seen if recipient is live in the room
+          seen: false,
           ...(replyToDoc ? { replyTo: replyToDoc } : {}),
         });
 
-        // Broadcast to everyone in the room (including sender for confirmation)
+        // Broadcast to everyone in the room (message arrives with seen: false = single tick)
         io.to('red-thread').emit('threadMoved', { message });
 
-        // Clear typing indicator for sender on the other side
+        // Clear typing indicator for sender
         socket.to('red-thread').emit('stopTyping', { sender });
 
-        // If recipient was online, immediately tell the sender their msg is seen
+        // If recipient is already in the room, mark seen immediately and notify sender
         if (recipientIsOnline) {
+          await Message.updateOne({ _id: message._id }, { $set: { seen: true } });
+          // Notify the SENDER only so their tick updates to double-tick
           socket.emit('messagesSeenUpdate', {
             messageIds: [String(message._id)],
             seenBy: recipientId,
+          });
+        }
+
+        // ── Web Push to recipient if they are NOT in the socket room ──────────
+        // If they're online in the room they see it live — no push needed.
+        // If they're offline (app closed, phone locked) — fire the push.
+        if (!recipientIsOnline) {
+          notifyNewMessage(sender, text.trim()).catch((err) => {
+            console.error('push notify error:', err.message);
           });
         }
       } catch (err) {
@@ -131,22 +140,18 @@ export function initSocket(io) {
     });
 
     // ── typing ───────────────────────────────────────────────────────────────
-    // Client sends: { sender }
     socket.on('typing', ({ sender } = {}) => {
       if (!ALLOWED_USERS.includes(sender)) return;
-      // Forward to everyone else in the room (i.e. the other person)
       socket.to('red-thread').emit('typing', { sender });
     });
 
     // ── stopTyping ───────────────────────────────────────────────────────────
-    // Client sends: { sender }
     socket.on('stopTyping', ({ sender } = {}) => {
       if (!ALLOWED_USERS.includes(sender)) return;
       socket.to('red-thread').emit('stopTyping', { sender });
     });
 
     // ── messageSeen ──────────────────────────────────────────────────────────
-    // Client sends: { viewer } — marks all unseen messages FROM the other user as seen
     socket.on('messageSeen', async ({ viewer } = {}) => {
       if (!ALLOWED_USERS.includes(viewer)) return;
 
@@ -168,7 +173,6 @@ export function initSocket(io) {
           { $set: { seen: true } }
         );
 
-        // Tell the original sender that their messages are now seen
         socket.to('red-thread').emit('messagesSeenUpdate', {
           messageIds: messageIds.map(String),
           seenBy: viewer,
@@ -185,7 +189,6 @@ export function initSocket(io) {
 
       if (!userId) return;
 
-      // Clear any active typing state for this user
       socket.to('red-thread').emit('stopTyping', { sender: userId });
 
       const hasOtherSockets = [...connectedUsers.values()].includes(userId);
