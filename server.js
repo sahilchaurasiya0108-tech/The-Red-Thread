@@ -1,15 +1,15 @@
+// ── MUST BE FIRST: loads .env before any other module reads process.env ──────
+import './env.js';
+
 import express from 'express';
 import http from 'http';
 import { Server } from 'socket.io';
 import cors from 'cors';
-import dotenv from 'dotenv';
 import mongoose from 'mongoose';
 
 import threadRouter from './routes/thread.js';
 import pushRouter from './routes/push.js';
 import { initSocket } from './socket.js';
-
-dotenv.config();
 
 const app = express();
 const server = http.createServer(app);
@@ -47,8 +47,6 @@ initSocket(io);
 
 // ── REST routes ───────────────────────────────────────────────────────────────
 app.use('/thread', threadRouter);
-
-// Push subscription management (subscribe / unsubscribe / vapid-key)
 app.use('/push', pushRouter);
 
 app.get('/health', (_req, res) => {

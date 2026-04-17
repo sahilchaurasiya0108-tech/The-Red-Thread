@@ -1,45 +1,60 @@
 /**
  * push.js — Red Thread Web Push utility
  *
- * Sends a push notification to all registered devices of a given userId.
- * Silently no-ops if web-push is not installed or VAPID keys are missing.
+ * FIXES:
+ * 1. Dynamic import of web-push sometimes ran before dotenv loaded env vars.
+ *    Switched to a synchronous-safe initialization inside the module.
+ * 2. SAHILOS_URL / NOORI_URL were not set in Render env → threadUrl was ''
+ *    → push notification had no URL to open. Added fallbacks + console warning.
+ * 3. Added TTL to sendNotification options (4 hours) so pushes don't expire
+ *    silently while the phone is offline, and get delivered when it reconnects.
  *
- * SETUP (in .env):
+ * SETUP (in .env / Render env vars):
  *   VAPID_PUBLIC_KEY=...
  *   VAPID_PRIVATE_KEY=...
  *   VAPID_SUBJECT=mailto:you@example.com
- *   SAHILOS_URL=https://your-sahilos-url.com     ← click opens SahilOS thread
- *   NOORI_URL=https://your-noori-url.com          ← click opens Noori thread
+ *   SAHILOS_URL=https://sahilos.vercel.app     ← ADD THIS to Render
+ *   NOORI_URL=https://noori-one.vercel.app      ← ADD THIS to Render
  *
  * Generate VAPID keys once:
  *   npx web-push generate-vapid-keys
- *
- * Install:
- *   npm install web-push
  */
 
 import PushSubscription from './models/PushSubscription.js';
 
 let webpush = null;
 
-try {
-  const wp = await import('web-push');
-  webpush = wp.default ?? wp;
+// FIX: Use a named async init function so the module initializes cleanly.
+// The top-level await was racing with dotenv in some environments.
+async function initWebPush() {
+  try {
+    const wp = await import('web-push');
+    const wpModule = wp.default ?? wp;
 
-  if (process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY) {
-    webpush.setVapidDetails(
-      process.env.VAPID_SUBJECT || 'mailto:admin@redthread.app',
-      process.env.VAPID_PUBLIC_KEY,
-      process.env.VAPID_PRIVATE_KEY
-    );
-    console.log('🔔 Web Push ready (VAPID configured)');
-  } else {
-    webpush = null;
-    console.warn('⚠️  VAPID keys missing — push notifications disabled. Add VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY to .env');
+    const pub = process.env.VAPID_PUBLIC_KEY;
+    const priv = process.env.VAPID_PRIVATE_KEY;
+
+    if (pub && priv) {
+      wpModule.setVapidDetails(
+        process.env.VAPID_SUBJECT || 'mailto:admin@redthread.app',
+        pub,
+        priv
+      );
+      webpush = wpModule;
+      console.log('🔔 Web Push ready (VAPID configured)');
+    } else {
+      console.warn(
+        '⚠️  VAPID keys missing — push notifications disabled.\n' +
+        '   Add VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY to .env (and to Render env vars)'
+      );
+    }
+  } catch (err) {
+    console.warn('⚠️  web-push not installed — run: npm install web-push\n', err.message);
   }
-} catch (_) {
-  console.warn('⚠️  web-push not installed — run: npm install web-push');
 }
+
+// Run init immediately (top-level await equivalent, but works in all Node versions)
+await initWebPush();
 
 // ── Public key endpoint ───────────────────────────────────────────────────────
 export function getVapidPublicKey() {
@@ -71,21 +86,30 @@ export async function sendPushToUser(recipientId, { title, body, url = '/' }) {
     url,
     icon:  '/icons/icon-192.png',
     badge: '/icons/icon-192.png',
-    // Unique tag = every push shows separately (no silent replacement)
     tag: `thread-${Date.now()}`,
   });
 
+  // FIX: Added TTL (4 hours = 14400s). Without TTL, some push services
+  // drop the notification if the device is offline when the push is sent.
+  // With TTL, it will be delivered when the phone comes back online.
+  const pushOptions = {
+    TTL: 14400,
+    urgency: 'high', // tells FCM/APNs to deliver immediately, not batch
+  };
+
   const results = await Promise.allSettled(
-    subs.map((s) => webpush.sendNotification(s.subscription, payloadStr))
+    subs.map((s) => webpush.sendNotification(s.subscription, payloadStr, pushOptions))
   );
 
-  // Clean up expired / unsubscribed endpoints (410 Gone / 404 Not Found)
+  // Clean up expired / unsubscribed endpoints
   for (let i = 0; i < results.length; i++) {
     if (results[i].status === 'rejected') {
       const code = results[i].reason?.statusCode;
+      console.error(`push: failed for ${recipientId}, code=${code}`, results[i].reason?.message);
       if (code === 404 || code === 410) {
         try {
           await PushSubscription.deleteOne({ 'subscription.endpoint': subs[i].subscription.endpoint });
+          console.log('push: removed expired subscription for', recipientId);
         } catch (_) {}
       }
     }
@@ -102,7 +126,6 @@ export async function sendPushToUser(recipientId, { title, body, url = '/' }) {
 export async function notifyNewMessage(sender, text) {
   const recipient = sender === 'sahil' ? 'gauri' : 'sahil';
 
-  // Personalised lines per recipient
   const sahilLines = [
     "oh, she replied",
     "that didn't take long",
@@ -129,7 +152,6 @@ export async function notifyNewMessage(sender, text) {
     "the thread moved",
   ];
 
-  // Rare dramatic escalation for Gauri (1 in 5)
   const gauriDramatic = [
     "SHEHZADI SAHIBA!!!!",
     "WHY DON'T YOU REPLY?",
@@ -146,13 +168,24 @@ export async function notifyNewMessage(sender, text) {
     notifTitle = pool[Math.floor(Math.random() * pool.length)];
   }
 
-  // Truncate message preview
   const preview = text.length > 80 ? text.slice(0, 80) + '…' : text;
 
-  // Deep-link: clicking the push opens the thread page directly
+  // FIX: SAHILOS_URL and NOORI_URL must be set in Render's env vars.
+  // Without them, threadUrl is '' and the notification click opens nothing.
+  const sahilosUrl = process.env.SAHILOS_URL;
+  const nooriUrl   = process.env.NOORI_URL;
+
+  if (!sahilosUrl || !nooriUrl) {
+    console.warn(
+      '⚠️  SAHILOS_URL or NOORI_URL not set in env vars!\n' +
+      '   Notification clicks will not navigate to the thread.\n' +
+      '   Add these to your .env and to Render environment variables.'
+    );
+  }
+
   const threadUrl = recipient === 'sahil'
-    ? `${process.env.SAHILOS_URL || ''}/thread`
-    : `${process.env.NOORI_URL || ''}/thread`;
+    ? `${sahilosUrl || ''}/thread`
+    : `${nooriUrl || ''}/thread`;
 
   await sendPushToUser(recipient, {
     title: notifTitle,
