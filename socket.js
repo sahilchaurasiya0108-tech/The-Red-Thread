@@ -5,6 +5,9 @@ import { notifyNewMessage } from './push.js';
 const ALLOWED_USERS = ['sahil', 'gauri'];
 
 // Track connected socket IDs → userId
+// ONLY sockets that called joinThread (real thread users) go here.
+// watchThread sockets (background notification listeners) are NOT added here,
+// so they never falsely inflate recipientIsOnline or presence.
 const connectedUsers = new Map(); // socketId → userId
 
 export function initSocket(io) {
@@ -79,6 +82,30 @@ export function initSocket(io) {
       } catch (err) {
         socket.emit('error', { message: 'Could not load messages.' });
       }
+    });
+
+    // ── watchThread ──────────────────────────────────────────────────────────
+    // Passive listener for background notification sockets (AppLayout / context).
+    // Joins the room to receive threadMoved events but does NOT register in
+    // connectedUsers — so it never falsely marks the user as "online" for
+    // presence or for read-receipt (seen: true) purposes.
+    socket.on('watchThread', async ({ userId } = {}) => {
+      if (!ALLOWED_USERS.includes(userId)) return;
+
+      // Join the room so this socket receives threadMoved broadcasts
+      socket.join('red-thread');
+
+      // Send history so the watcher can deduplicate old messages
+      try {
+        const messages = await Message.find({ threadId: 'red-thread' })
+          .sort({ createdAt: 1 })
+          .limit(200)
+          .select('_id sender')
+          .lean();
+        socket.emit('threadHistory', { messages });
+      } catch (_) {}
+
+      // No presence update, no connectedUsers registration — intentionally passive
     });
 
     // ── threadMoved ──────────────────────────────────────────────────────────
